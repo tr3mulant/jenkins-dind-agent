@@ -1,0 +1,101 @@
+# Long-lived Jenkins inbound agent for the Dowscripts repo.
+#
+# The agent dials OUT to the controller, so the controller never needs a route
+# back into this host -- only outbound 443 to test.irongateenterprises.com.
+#
+#   docker compose up -d --build
+#
+# Create the node in Jenkins FIRST (see README.md); JENKINS_SECRET comes from
+# that node's connection page.
+
+name: dowscripts-jenkins-agent
+
+services:
+  agent:
+    build:
+      context: .
+      args:
+        JENKINS_AGENT_TAG: ${JENKINS_AGENT_TAG:-latest-jdk21}
+        PHP_VERSION: ${PHP_VERSION:-8.4}
+        NODE_MAJOR: ${NODE_MAJOR:-22}
+    image: dowscripts/jenkins-agent:${AGENT_IMAGE_TAG:-latest}
+    container_name: dowscripts-jenkins-agent
+    restart: unless-stopped
+    # The agent forks git/composer/npm freely; PID 1 reaping keeps zombies from
+    # accumulating over a long-lived container's life.
+    init: true
+
+    environment:
+      JENKINS_URL: ${JENKINS_URL:?set JENKINS_URL in .env}
+      JENKINS_SECRET: ${JENKINS_SECRET:?copy the secret from the node page in Jenkins}
+      JENKINS_AGENT_NAME: ${JENKINS_AGENT_NAME:-dowscripts-docker}
+      JENKINS_AGENT_WORKDIR: /home/jenkins/agent
+      # Tunnels the agent protocol over the existing HTTPS port instead of the
+      # separate TCP inbound port (50000). Nothing extra to open on the server.
+      JENKINS_WEB_SOCKET: "true"
+
+    volumes:
+      # Workspaces. A named volume rather than a bind mount so uid 1000 inside
+      # the container owns it without any chown dance on the host.
+      - agent-workdir:/home/jenkins/agent
+      # Dependency caches -- without these every build re-resolves the whole of
+      # composer.lock and re-downloads the npm tree for web/.
+      - composer-cache:/home/jenkins/.composer
+      - npm-cache:/home/jenkins/.npm
+
+      # Uncomment to let pipelines drive the host's Docker (build images, roll
+      # web/compose.yaml). This is effectively root on the host for anyone who
+      # can run a job on this agent -- only do it if you trust every job.
+      # Pair it with the group_add below.
+      # - /var/run/docker.sock:/var/run/docker.sock
+
+    # Grants the in-container `jenkins` user access to the mounted socket.
+    # Set DOCKER_GID in .env to: getent group docker | cut -d: -f3
+    # group_add:
+    #   - ${DOCKER_GID:-999}
+
+    # If this agent runs on the SAME host as the controller, the public hostname
+    # resolves to your public IP and has to hairpin back through the router --
+    # which plenty of routers refuse, so the agent hangs on connect even though
+    # the URL works fine from a browser. Two fixes, either is fine:
+    #
+    #   a) pin the hostname to the host itself, keeping JENKINS_URL as-is:
+    # extra_hosts:
+    #   - "test.irongateenterprises.com:host-gateway"
+    #
+    #   b) or bypass the proxy entirely and talk to Jenkins directly, setting
+    #      JENKINS_URL=http://host.docker.internal:8080/ in .env:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+    networks:
+      - agent
+
+    # A runaway `npm run build` or PHPUnit run shouldn't be able to take the
+    # whole bare-metal box down with it.
+    mem_limit: ${AGENT_MEM_LIMIT:-4g}
+
+# No database service here on purpose.
+#
+# The suite runs on in-memory sqlite: config/database.php defaults to sqlite and
+# phpunit.xml doesn't pin a connection, so DB_CONNECTION=sqlite +
+# DB_DATABASE=:memory: in the test stage is all it takes. Nothing to start, and
+# each run gets a clean schema.
+#
+# That's safe here because the app carries no Postgres-specific SQL -- no
+# DB::raw, no jsonb, no ILIKE, no ON CONFLICT anywhere in app/, database/ or
+# tests/ -- so sqlite reproduces the schema-builder migrations faithfully. If
+# that stops being true, add a throwaway postgres:18-alpine service on the
+# `agent` network with tmpfs storage and point the test stage at it. Do not
+# point CI at the pgsql in web/compose.yaml: 47 test files use RefreshDatabase,
+# which will migrate and truncate whatever connection it is handed, and that one
+# holds live runs, users and marketplace credentials.
+
+networks:
+  agent:
+    driver: bridge
+
+volumes:
+  agent-workdir:
+  composer-cache:
+  npm-cache:
