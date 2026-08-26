@@ -1,0 +1,2 @@
+# Holds JENKINS_SECRET. .env.example is the tracked template.
+.env
