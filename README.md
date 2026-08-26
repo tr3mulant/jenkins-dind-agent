@@ -3,7 +3,7 @@
 A long-lived inbound (JNLP) agent for the Dowscripts pipeline, plus a private
 Docker daemon for it to build against.
 
-The agent dials **out** to the controller at `test.irongateenterprises.com` over
+The agent dials **out** to the controller at `YOUR_JENKINS_DOMAIN` over
 HTTPS. The controller never connects back, so there is nothing to expose on this
 host and no inbound firewall rule to add — including no port 50000, because
 `JENKINS_WEB_SOCKET=true` tunnels the agent protocol over 443.
@@ -76,7 +76,7 @@ agents. (To use the TCP port instead, set `JENKINS_WEB_SOCKET=false` and open
 isn't enough.
 
 ```sh
-scp -r Dowscripts-jenkins-agent/ test.irongateenterprises.com:~/
+scp -r Dowscripts-jenkins-agent/ YOUR_JENKINS_DOMAIN:~/
 ```
 
 **3. Configure and start.**
@@ -145,7 +145,7 @@ Verify the proxy independently of the agent:
 ```sh
 curl -sS -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
   -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  https://test.irongateenterprises.com/wsagents/ | head -20
+  https://YOUR_JENKINS_DOMAIN/wsagents/ | head -20
 ```
 
 `400 This endpoint is only for use from agent.jar in WebSocket mode`, served by
@@ -176,7 +176,7 @@ The public hostname resolves to your public IP, so a container on that same host
 has to hairpin back through the router to reach it — and many routers won't.
 The URL works from a browser while the agent hangs on connect. Uncomment one of
 the `extra_hosts` blocks in `docker-compose.yml`: either pin
-`test.irongateenterprises.com` to `host-gateway`, or point `JENKINS_URL` at
+`YOUR_JENKINS_DOMAIN` to `host-gateway`, or point `JENKINS_URL` at
 `http://host.docker.internal:8080/` and bypass the reverse proxy entirely.
 
 ### Pre-build fails: "cannot reach a daemon"
