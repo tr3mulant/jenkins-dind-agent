@@ -15,6 +15,12 @@
 #
 # git, bash, ssh and scp come from the base image; deploy stages need the last
 # two.
+#
+# All three docker packages are required. Without docker-buildx-plugin, Compose
+# falls back to the legacy builder and BuildKit-only Dockerfile features fail
+# here while working on every developer machine, which ships buildx by default.
+# That drift costs more than the features do. BuildKit itself runs in dockerd
+# (the dind service); buildx is only the CLI plugin that drives it.
 
 ARG JENKINS_AGENT_TAG=latest-jdk21
 FROM jenkins/inbound-agent:${JENKINS_AGENT_TAG}
@@ -38,6 +44,7 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
     && apt-get update && apt-get install -y --no-install-recommends \
         docker-ce-cli \
         docker-compose-plugin \
+        docker-buildx-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep this. docker-compose.yml mounts a named volume here, and a named volume
