@@ -1,16 +1,20 @@
-# Jenkins inbound (JNLP) agent for this repo.
+# Jenkins inbound (JNLP) agent: the official base image plus the Docker CLI.
 #
-# Based on the official inbound-agent image so the agent runtime, the `jenkins`
-# user (uid 1000) and the connection entrypoint are already correct. The only
-# thing layered on top is the Docker CLI.
+# Based on jenkins/inbound-agent so the agent runtime, the `jenkins` user
+# (uid 1000) and the connection entrypoint are already correct.
 #
-# No PHP, Composer or Node here on purpose: every one of those runs inside the
-# laravel.test container the pipeline starts, never on the agent. See
-# scripts/ci/jenkins-step1-build-test-containers.sh -- every call goes through
-# its appexec() helper. Adding a toolchain here builds ~1GB nothing invokes.
+# No language toolchain here on purpose -- no PHP, Node, Python, Ruby. Build
+# tooling belongs in the containers a pipeline starts, not on the agent:
 #
-# git, bash, ssh and scp come from the base image; the Deploy stage needs the
-# last two.
+#   - baking it in pins every job on this node to one version
+#   - it adds third-party apt repos to keep working across base-image OS bumps
+#   - a shared agent would need the union of every project's toolchain
+#
+# Pipelines should exec into their own containers instead. That is what the
+# dind daemon in docker-compose.yml is for.
+#
+# git, bash, ssh and scp come from the base image; deploy stages need the last
+# two.
 
 ARG JENKINS_AGENT_TAG=latest-jdk21
 FROM jenkins/inbound-agent:${JENKINS_AGENT_TAG}

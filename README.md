@@ -1,12 +1,17 @@
-# Dockerized Jenkins agent
+# jenkins-dind-agent
 
-A long-lived inbound (JNLP) agent for the Dowscripts pipeline, plus a private
-Docker daemon for it to build against.
+A long-lived Jenkins inbound agent plus a private Docker daemon for it to build
+on. One shared node, any number of jobs.
 
-The agent dials **out** to the controller at `YOUR_JENKINS_DOMAIN` over
-HTTPS. The controller never connects back, so there is nothing to expose on this
-host and no inbound firewall rule to add — including no port 50000, because
-`JENKINS_WEB_SOCKET=true` tunnels the agent protocol over 443.
+The agent dials **out** to the controller over HTTPS. The controller never
+connects back, so there is nothing to expose on this host and no inbound
+firewall rule to add — including no port 50000, because `JENKINS_WEB_SOCKET=true`
+tunnels the agent protocol over 443.
+
+> This is an **inbound (JNLP)** agent, not Jenkins' "SSH agent" launch method.
+> Those are opposites: an SSH agent means the controller connects _in_ to a
+> listening sshd. Nothing here listens. `ssh` and `scp` are in the image for
+> pipelines that deploy over SSH, not for the agent's own connection.
 
 ## Architecture
 
@@ -14,35 +19,31 @@ Two containers, siblings, not nested:
 
 ```
 host
-├── dowscripts-jenkins-agent   agent.jar, git, docker CLI. Runs no containers.
-└── dowscripts-jenkins-dind    dockerd
-    ├── laravel.test           composer, npm, php, artisan, PHPUnit
-    └── pgsql
+├── <stack>-agent    agent.jar, git, docker CLI. Runs no containers.
+└── <stack>-dind     dockerd
+    └── …            every container your pipelines start
 ```
 
 The agent is a Docker **client** only. It points at `dind` over TLS via
-`DOCKER_HOST`, and every container the pipeline starts is a child of that
-daemon. Nothing runs on the agent itself except `git`, `ssh`/`scp` for the
-deploy, and the CLI.
+`DOCKER_HOST`, and every container a pipeline starts is a child of that daemon.
 
-The host's own daemon is deliberately out of reach. The Jenkins controller runs
-on this same box, so a job that could talk to the host socket could read
-`$JENKINS_HOME` and every credential in it — the registry login and the
-production deploy key included.
+The host's own daemon is deliberately out of reach. If the Jenkins controller
+shares this box, a job that could talk to the host socket could read
+`$JENKINS_HOME` and every credential in it.
 
 ### The one rule that matters
 
 **`agent-workdir` is mounted at `/home/jenkins/agent` in both containers, and it
 has to stay that way.**
 
-Compose resolves bind mounts to absolute paths on the *client*, then hands those
-paths to the daemon, which resolves them against *its own* filesystem.
-`web/compose.yaml` mounts `.:/var/www/html` and `..:/var/www/repo` out of the
-Jenkins workspace. If dind can't see that path, dockerd doesn't error — it
-silently creates empty root-owned directories and mounts those instead.
+Compose resolves bind mounts to absolute paths on the _client_, then hands those
+paths to the daemon, which resolves them against _its own_ filesystem. Any
+pipeline that bind-mounts its workspace into a container — the common case — is
+relying on both sides agreeing on that path.
 
-Symptom: `composer install` fails on a missing `composer.json`, and the
-root-owned debris defeats the pipeline's `cleanWs()`.
+If dind can't see it, dockerd doesn't error. It silently creates empty
+root-owned directories and mounts those instead, so the job fails somewhere that
+points nowhere near the cause, and the root-owned debris defeats `cleanWs()`.
 
 ## Setup
 
@@ -51,19 +52,19 @@ does.
 
 Manage Jenkins → Nodes → New Node:
 
-| Field | Value |
-| --- | --- |
-| Name | `dowscripts-docker` |
-| Type | Permanent Agent |
-| Remote root directory | `/home/jenkins/agent` |
-| Labels | `php84` |
-| Usage | Use this node as much as possible |
-| Launch method | **Launch agent by connecting it to the controller** |
+| Field                 | Value                                               |
+| --------------------- | --------------------------------------------------- |
+| Name                  | matches `JENKINS_AGENT_NAME` in `.env`              |
+| Type                  | Permanent Agent                                     |
+| Remote root directory | `/home/jenkins/agent`                               |
+| Labels                | whatever your Jenkinsfiles ask for                  |
+| # of executors        | `1` (see _Sharing one agent_)                       |
+| Usage                 | Use this node as much as possible                   |
+| Launch method         | **Launch agent by connecting it to the controller** |
 
-The label must match the Jenkinsfile's `agent { label 'php84' }`. It's a fossil
-— there is no PHP on this agent any more — but a mismatch doesn't fail the
-build, it leaves the job queued indefinitely with no error. Rename in both
-places or neither.
+Labels are how jobs find this node. A Jenkinsfile asking for a label the node
+doesn't carry doesn't fail — it queues indefinitely with no error, so check both
+sides match.
 
 Save, reopen the node, and copy the secret from the connection instructions.
 
@@ -71,21 +72,15 @@ Under Manage Jenkins → Security, confirm **WebSocket** is permitted for inboun
 agents. (To use the TCP port instead, set `JENKINS_WEB_SOCKET=false` and open
 50000 to this host.)
 
-**2. Copy this whole directory to the server.** The compose file builds from
-`Dockerfile` in the same directory (`context: .`), so the compose file alone
-isn't enough.
-
-```sh
-scp -r Dowscripts-jenkins-agent/ YOUR_JENKINS_DOMAIN:~/
-```
+**2. Copy this directory to the host.** The compose file builds from
+`Dockerfile` beside it (`context: .`), so the compose file alone isn't enough.
 
 **3. Configure and start.**
 
 ```sh
-cd ~/Dowscripts-jenkins-agent
 cp .env.example .env
 chmod 600 .env          # holds the agent secret
-$EDITOR .env            # set JENKINS_SECRET
+$EDITOR .env            # JENKINS_URL, JENKINS_AGENT_NAME, JENKINS_SECRET
 
 docker compose up -d --build
 docker compose logs -f agent
@@ -106,6 +101,44 @@ A date means bind mounts resolve coherently between the agent and dind. `cat:
 /p/stamp: No such file or directory` means they don't — fix the volume mounts
 before running a build, or it will scatter root-owned directories.
 
+## What pipelines can assume
+
+The agent has `docker`, `docker compose`, `git`, `bash`, `ssh` and `scp`. That
+is the whole toolchain.
+
+**No language runtimes, and don't add any.** Install nothing on the agent —
+start a container and exec into it. A shared node carrying every project's
+toolchain would need the union of all of them, pinned to one version each, and
+every project would be stuck with whichever version won.
+
+```groovy
+// Instead of `sh 'composer install'` on the agent:
+sh 'docker compose exec -T -u 1000 app composer install'
+```
+
+Note the `-u`: `docker compose exec` ignores the image's entrypoint and runs as
+the image's configured user, which is often root. Without it, builds write
+root-owned files into the workspace and `cleanWs()` can't remove them.
+
+## Sharing one agent
+
+Every job on this node shares one dind daemon. That buys a warm layer cache
+across projects, and costs some isolation:
+
+- **Compose project names must be unique per job.** Set `COMPOSE_PROJECT_NAME`
+  in each Jenkinsfile. Two jobs defaulting to the directory name will tear down
+  each other's containers.
+- **Published ports are shared.** They bind inside dind's network namespace, not
+  the host's — which is why nothing leaks to the outside — but that namespace is
+  common to every concurrent job. Two jobs publishing the same port collide.
+- **`docker login` state is shared.** A `docker logout` in one job's `post`
+  block pulls the credential out from under another job running concurrently.
+- **Memory is shared.** `BUILD_MEM_LIMIT` caps the daemon, so it caps all
+  concurrent builds together, not each one.
+
+Start with **1 executor**. Raise it only after the jobs that would run
+concurrently have been checked against the four points above.
+
 ## Troubleshooting
 
 ### "Handshake error" / "Did not receive X-Remoting-Capability header"
@@ -120,15 +153,15 @@ docker compose exec agent curl -sSI "$JENKINS_URL"tcpSlaveAgentListener/
 A 404 carrying `X-Jenkins:` headers means Jenkins is fine and the transport is
 the problem — the agent must use WebSocket instead.
 
-**Check the reverse proxy before chasing the agent flag.** Apache terminates TLS
-on this server and proxies 443 to `localhost:8080` using plain `mod_proxy_http`,
-which cannot forward the WebSocket `Upgrade` handshake. With the TCP port
-disabled *and* WebSocket blocked at the proxy, both transports are closed and no
-agent-side setting will help.
+**Check the reverse proxy before chasing the agent flag.** If Apache terminates
+TLS and proxies to `localhost:8080` with plain `mod_proxy_http`, it cannot
+forward the WebSocket `Upgrade` handshake. With the TCP port disabled _and_
+WebSocket blocked at the proxy, both transports are closed and no agent-side
+setting will help.
 
-The fix is one directive in the `*:443` vhost. On Apache >= 2.4.47 (this server
-runs 2.4.52) `mod_proxy_http` forwards the upgrade itself via `upgrade=websocket`
-— no `mod_proxy_wstunnel`, and no separate `/wsagents/` rule to mis-order:
+The fix is one directive in the `*:443` vhost. On Apache >= 2.4.47
+`mod_proxy_http` forwards the upgrade itself via `upgrade=websocket` — no
+`mod_proxy_wstunnel`, and no separate `/wsagents/` rule to mis-order:
 
 ```apache
 ProxyTimeout 3600
@@ -137,15 +170,15 @@ ProxyPass / http://localhost:8080/ nocanon upgrade=websocket
 
 `upgrade=websocket` belongs on the `http://` catch-all. Putting it on a `ws://`
 wstunnel rule is a no-op — that combination looks plausible and silently does
-nothing. Then `sudo apachectl configtest && sudo systemctl reload apache2`.
-Nothing changes on the agent side.
+nothing. Then `apachectl configtest && systemctl reload apache2`. Nothing
+changes on the agent side.
 
 Verify the proxy independently of the agent:
 
 ```sh
 curl -sS -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
   -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  https://YOUR_JENKINS_DOMAIN/wsagents/ | head -20
+  https://jenkins.example.com/wsagents/ | head -20
 ```
 
 `400 This endpoint is only for use from agent.jar in WebSocket mode`, served by
@@ -156,9 +189,8 @@ Once the proxy is confirmed, a persisting handshake error means Jenkins is
 rejecting the agent itself: check that the node name matches
 `JENKINS_AGENT_NAME` exactly and that `JENKINS_SECRET` is current.
 
-This also unblocks agents on machines other than the controller, which the
-alternative — bypassing Apache via `host.docker.internal:8080`, see below —
-does not.
+Fixing the proxy also unblocks agents on machines other than the controller,
+which the `host.docker.internal` workaround below does not.
 
 To confirm the flag itself reached the agent:
 
@@ -170,18 +202,17 @@ If `-webSocket` is missing, pass it explicitly — the entrypoint appends `"$@"`
 `command: ["-webSocket"]`. Don't add it when already present; args4j rejects the
 duplicate.
 
-### If the agent runs on the controller's own host
+### The agent hangs on connect, but the URL works in a browser
 
-The public hostname resolves to your public IP, so a container on that same host
-has to hairpin back through the router to reach it — and many routers won't.
-The URL works from a browser while the agent hangs on connect. Uncomment one of
-the `extra_hosts` blocks in `docker-compose.yml`: either pin
-`YOUR_JENKINS_DOMAIN` to `host-gateway`, or point `JENKINS_URL` at
-`http://host.docker.internal:8080/` and bypass the reverse proxy entirely.
+The agent is on the controller's own host. The public hostname resolves to your
+public IP, so the container has to hairpin back through the router — and many
+routers refuse. Uncomment an `extra_hosts` entry on the `agent` service: pin the
+hostname to `host-gateway`, or point `JENKINS_URL` at
+`http://host.docker.internal:8080/` and bypass the proxy entirely.
 
-### Pre-build fails: "cannot reach a daemon"
+### A stage fails with "cannot reach a daemon"
 
-The agent's `DOCKER_HOST` points at dind and dind isn't up or healthy.
+`DOCKER_HOST` points at dind and dind isn't up or healthy.
 
 ```sh
 docker compose ps                     # dind should be (healthy)
@@ -195,36 +226,16 @@ until dind has generated its TLS certs and dockerd is listening.
 ### `docker push` fails with "x509: certificate signed by unknown authority"
 
 The dind daemon is new and doesn't trust your registry's CA, even if the host
-daemon does. Mount the host's copy into dind:
-
-```yaml
-      - /etc/docker/certs.d:/etc/docker/certs.d:ro
-```
+daemon does. Uncomment the `/etc/docker/certs.d` mount on the `dind` service.
 
 ### Pulls inside dind hang partway
 
-Nested bridge networking on a tunnelled link. Lower the MTU on the dind service:
+Nested bridge networking on a tunnelled link. Uncomment
+`command: ["--mtu=1400"]` on the `dind` service.
 
-```yaml
-    command: ["--mtu=1400"]
-```
+### A build fails with an empty workspace inside its container
 
-## What's in the image
-
-The Docker CLI and the compose plugin. That's it.
-
-`git`, `bash`, `ssh` and `scp` come from the `jenkins/inbound-agent` base — the
-Deploy stage needs the last two.
-
-**No PHP, Composer or Node, on purpose.** Every one of those runs inside the
-`laravel.test` container, never on the agent: check
-`scripts/ci/jenkins-step1-build-test-containers.sh` and note that every call
-goes through its `appexec()` helper, which is `compose exec … laravel.test`.
-A toolchain here would be ~1GB nothing invokes, plus two third-party apt repos
-(Sury, NodeSource) to keep working across Debian releases.
-
-This also settles the old "which PHP does CI test?" question — the suite runs on
-whatever `web/compose.yaml` builds, which is the same runtime developers use.
+The workspace path invariant is broken. Run the step 4 probe.
 
 ## Operations
 
@@ -234,16 +245,12 @@ docker compose logs -f dind     # build/daemon troubleshooting
 docker compose up -d --build    # rebuild after changing the Dockerfile
 docker compose down             # stop (node shows offline in Jenkins)
 
-docker volume rm dowscripts-jenkins-agent_agent-workdir   # wipe workspaces
-docker volume rm dowscripts-jenkins-agent_docker-lib      # wipe the layer cache
+docker volume rm ${STACK_NAME}_agent-workdir   # wipe workspaces
+docker volume rm ${STACK_NAME}_docker-lib      # wipe the layer cache
 ```
 
 Don't run `docker compose down -v` casually — it takes `docker-lib` with it, and
-the next build recompiles the whole production PHP layer from scratch.
+every job's next build starts with a cold cache.
 
 Rotate the secret by deleting and recreating the node in Jenkins, then updating
 `.env` and running `docker compose up -d`.
-
-Tests run on in-memory sqlite; there is no database service here to start. See
-the comment at the bottom of `docker-compose.yml` for why, and for the one thing
-not to do (point CI at the app's own Postgres).
