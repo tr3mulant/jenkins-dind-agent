@@ -37,7 +37,20 @@ services:
     init: true
 
     environment:
-      DOCKER_HOST: tcp://dind:2376
+      # tcp://docker, NOT tcp://dind, even though the service is named dind.
+      #
+      # dind generates its own server cert on first boot, and it does not know
+      # what we named the service. The SANs it issues are fixed: the container
+      # ID, the literal name `docker`, and localhost. Dialing tcp://dind:2376
+      # therefore fails TLS hostname verification -- and it fails LATE, at the
+      # first docker command in a build, not at container start:
+      #
+      #   x509: certificate is valid for 5c02f14a7fdc, docker, localhost,
+      #   not dind
+      #
+      # The `docker` network alias on the dind service below is what makes this
+      # name resolve. Keep the two together; changing either alone breaks CI.
+      DOCKER_HOST: tcp://docker:2376
       DOCKER_TLS_VERIFY: "1"
       DOCKER_CERT_PATH: /certs/client
       JENKINS_URL: ${JENKINS_URL:?set JENKINS_URL in .env}
@@ -123,8 +136,27 @@ services:
       # new and trusts nothing the host daemon may already trust, so a push
       # fails with "x509: certificate signed by unknown authority".
       # - /etc/docker/certs.d:/etc/docker/certs.d:ro
+
+    # The `docker` alias is load-bearing, not cosmetic.
+    #
+    # dind issues its own server cert at first boot with a fixed SAN list: the
+    # container ID, the literal name `docker`, and localhost. It has no way to
+    # know we named this service `dind`, so `dind` is not in that list and a
+    # TLS-verifying client dialing tcp://dind:2376 is rejected:
+    #
+    #   x509: certificate is valid for 5c02f14a7fdc, docker, localhost, not dind
+    #
+    # Of the three names in the cert, only `docker` is usable from the agent --
+    # localhost is a different container, and the container ID changes on every
+    # recreate. Hence the alias, and hence DOCKER_HOST on the agent.
+    #
+    # Aliased rather than renamed so the stack still reads as agent + dind and
+    # `docker compose logs dind` keeps working. The service name still resolves;
+    # it just can't pass verification, so don't point clients at it.
     networks:
-      - agent
+      agent:
+        aliases:
+          - docker
 
     # Only if pulls inside dind hang partway -- nested bridge networking on a
     # tunnelled link. Lower the MTU until they complete.
@@ -135,11 +167,22 @@ services:
     # concurrent jobs share it.
     mem_limit: ${BUILD_MEM_LIMIT:-4g}
 
-    # Gates the agent's start until certs exist and dockerd is listening.
-    # `docker info` needs no TLS here -- dockerd also listens on the local
-    # socket. ~100s budget; cert generation plus startup is normally 5-15s.
+    # Gates the agent's start until dind is actually usable BY THE AGENT.
+    #
+    # This deliberately does not use the plain `docker info` that the local
+    # socket answers. That check passed for a stack whose TLS name the agent
+    # could not verify at all: dind reported (healthy), the agent started, and
+    # every build failed minutes later on an x509 error that named neither the
+    # cause nor the fix. A green healthcheck that doesn't test the path the
+    # client uses is worse than no healthcheck.
+    #
+    # So dial the same way the agent does -- over TCP, by the `docker` alias,
+    # with verification on, using the same client certs the agent mounts. If
+    # this passes, the agent's first docker command will too.
+    #
+    # ~100s budget; cert generation plus startup is normally 5-15s.
     healthcheck:
-      test: ["CMD", "docker", "info"]
+      test: ["CMD-SHELL", "DOCKER_HOST=tcp://docker:2376 DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH=/certs/client docker info >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       retries: 20

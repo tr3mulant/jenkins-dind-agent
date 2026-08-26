@@ -24,8 +24,14 @@ host
     └── …            every container your pipelines start
 ```
 
-The agent is a Docker **client** only. It points at `dind` over TLS via
+The agent is a Docker **client** only. It points at the dind daemon over TLS via
 `DOCKER_HOST`, and every container a pipeline starts is a child of that daemon.
+
+It dials it as `tcp://docker:2376`, not `tcp://dind:2376`. dind's self-issued
+server cert names the container id, `docker` and `localhost` and nothing else,
+so the service name cannot pass TLS verification; the `docker` network alias on
+the dind service is what makes the working name resolve. The two are a pair —
+neither is decoration.
 
 The host's own daemon is deliberately out of reach. If the Jenkins controller
 shares this box, a job that could talk to the host socket could read
@@ -212,16 +218,31 @@ hostname to `host-gateway`, or point `JENKINS_URL` at
 
 ### A stage fails with "cannot reach a daemon"
 
-`DOCKER_HOST` points at dind and dind isn't up or healthy.
+Run `docker compose exec agent docker version` first and read the last line. It
+splits into two very different problems.
+
+**`x509: certificate is valid for …, not dind`** — dind is up, healthy, and
+listening; only the *name* is wrong. dind issues its own server cert at first
+boot with a fixed SAN list (container id, `docker`, `localhost`) and cannot know
+what the service was named, so `tcp://dind:2376` fails hostname verification.
+The agent must dial `tcp://docker:2376`, which works because the dind service
+carries a `docker` network alias. Both halves ship in `docker-compose.yml`;
+if someone dropped one, restore it. Nothing needs regenerating — `docker` has
+been in that cert since the day it was issued.
+
+**Anything else** (`connection refused`, a timeout, a raw
+`dial unix /var/run/docker.sock`) — dind really isn't up, or `DOCKER_HOST` is
+unset.
 
 ```sh
 docker compose ps                     # dind should be (healthy)
 docker compose logs dind
-docker compose exec agent docker version
+docker compose exec agent env | grep DOCKER_
 ```
 
-`depends_on: service_healthy` normally prevents this — the agent shouldn't start
-until dind has generated its TLS certs and dockerd is listening.
+`depends_on: service_healthy` normally prevents the second case, and since the
+healthcheck now dials over TLS by the same name the agent uses, it prevents the
+first as well: a stack that would fail verification never reports healthy.
 
 ### `docker push` fails with "x509: certificate signed by unknown authority"
 
